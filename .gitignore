@@ -1,0 +1,14 @@
+# secrets
+.arena-credentials*
+agent_id*.txt
+chipzen.toml
+# runtime data / logs
+*.log
+*.jsonl
+*.jsonl.gz
+opponent_stats_cache.json
+introspection.json
+eval_s1_leaderboard*.json
+backups/
+__pycache__/
+.claude/

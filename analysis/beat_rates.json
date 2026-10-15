@@ -1,0 +1,198 @@
+{
+"Flop|big|air": [
+49,
+49
+],
+"Flop|big|pair_low": [
+39,
+42
+],
+"Flop|big|pair_top": [
+6,
+7
+],
+"Flop|big|trips+": [
+1,
+1
+],
+"Flop|big|two_pair": [
+5,
+6
+],
+"Flop|call|air": [
+142,
+204
+],
+"Flop|call|pair_low": [
+83,
+273
+],
+"Flop|call|pair_top": [
+20,
+187
+],
+"Flop|call|trips+": [
+1,
+44
+],
+"Flop|call|two_pair": [
+8,
+50
+],
+"Flop|med|air": [
+290,
+329
+],
+"Flop|med|pair_low": [
+113,
+148
+],
+"Flop|med|pair_top": [
+16,
+61
+],
+"Flop|med|trips+": [
+0,
+16
+],
+"Flop|med|two_pair": [
+7,
+19
+],
+"Flop|raise|air": [
+24,
+25
+],
+"Flop|raise|pair_low": [
+32,
+33
+],
+"Flop|raise|pair_top": [
+18,
+29
+],
+"Flop|raise|trips+": [
+0,
+13
+],
+"Flop|raise|two_pair": [
+9,
+17
+],
+"Flop|small|air": [
+396,
+453
+],
+"Flop|small|pair_low": [
+118,
+185
+],
+"Flop|small|pair_top": [
+8,
+82
+],
+"Flop|small|trips+": [
+0,
+14
+],
+"Flop|small|two_pair": [
+3,
+21
+],
+"River|med|air": [
+2,
+2
+],
+"River|med|trips+": [
+0,
+1
+],
+"River|small|two_pair": [
+0,
+1
+],
+"Turn|big|air": [
+20,
+23
+],
+"Turn|big|pair_low": [
+14,
+18
+],
+"Turn|big|trips+": [
+0,
+1
+],
+"Turn|big|two_pair": [
+4,
+6
+],
+"Turn|call|air": [
+6,
+6
+],
+"Turn|call|pair_low": [
+1,
+6
+],
+"Turn|call|pair_top": [
+1,
+2
+],
+"Turn|call|trips+": [
+0,
+1
+],
+"Turn|call|two_pair": [
+0,
+2
+],
+"Turn|med|air": [
+29,
+38
+],
+"Turn|med|pair_low": [
+31,
+41
+],
+"Turn|med|pair_top": [
+4,
+14
+],
+"Turn|med|trips+": [
+4,
+11
+],
+"Turn|med|two_pair": [
+10,
+21
+],
+"Turn|raise|air": [
+1,
+1
+],
+"Turn|raise|pair_low": [
+2,
+2
+],
+"Turn|small|air": [
+58,
+64
+],
+"Turn|small|pair_low": [
+25,
+38
+],
+"Turn|small|pair_top": [
+3,
+11
+],
+"Turn|small|trips+": [
+0,
+6
+],
+"Turn|small|two_pair": [
+2,
+9
+]
+}
