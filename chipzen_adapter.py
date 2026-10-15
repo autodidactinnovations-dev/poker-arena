@@ -263,8 +263,32 @@ def hu_filter(decision, state, table):
     return out, f"chen {chen} < {need}"
 
 
+# --- Call-down experiment (TEST ONLY) ---------------------------------------
+# Heads-up, the brakes below fold big pots. Chipzen never shows the opponent's
+# cards after a fold, so we can't tell whether those folds beat bluffs. With
+# CHIPZEN_CALLDOWN=1 these brake folds become calls, so the hand goes to
+# showdown and the opponent's cards get logged (chipzen_showdowns.jsonl).
+# Loses chips on purpose - unrated practice matches only.
+import os
+CALLDOWN = os.environ.get("CHIPZEN_CALLDOWN") == "1"
+CALLDOWN_BRAKES = {"stack_risk_cap", "stalled_guard", "aggression_fold",
+                   "polarize_fold_vs_raise", "velocity_brake"}
+
+
+def calldown_filter(decision, state):
+    if not CALLDOWN or len(state.opponent_stacks) != 1:
+        return decision
+    by = (decision.get("_debug") or {}).get("decided_by")
+    if str(decision.get("action")).lower() == "fold" and by in CALLDOWN_BRAKES and "call" in (state.valid_actions or []):
+        out = dict(decision, action="call", amount=0)
+        out["_debug"] = dict(decision.get("_debug") or {}, decided_by=f"calldown_{by}")
+        return out
+    return decision
+
+
 def decide_chipzen(state, game_config, match_id="cz"):
     table = to_devfun_table(state, game_config, match_id)
     decision = L.decide_live(table)
     decision, _ = hu_filter(decision, state, table)
+    decision = calldown_filter(decision, state)
     return to_chipzen_action(decision, state), decision

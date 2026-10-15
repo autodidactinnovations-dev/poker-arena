@@ -23,6 +23,7 @@ heads-up), so per PRINCIPLES.md they must never be pooled.
 
 import asyncio
 import json
+import sys
 import time
 
 from chipzen import Bot, run_external_bot
@@ -66,10 +67,23 @@ class PokerArenaBot(Bot):
         print(f"[{state.phase}] hole={rec['hole']} board={rec['board']} -> {rec['sent']} ({dt}s)", flush=True)
         return action
 
+    def on_round_result(self, message):
+        # Log every hand result; showdown hands reveal the opponent's cards.
+        try:
+            res = message.get("result") or (message.get("state") or {})
+            with open("chipzen_showdowns.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps({"match": self.match_id, "calldown": A.CALLDOWN,
+                                    "round_id": message.get("round_id"), "result": res}) + "\n")
+        except Exception:
+            pass
+
     def on_match_end(self, results):
         print(f"[match_end] {self.match_id} {results}", flush=True)
 
 
 if __name__ == "__main__":
     # Token / bot_id come from chipzen.toml. One instance per match.
-    asyncio.run(run_external_bot(PokerArenaBot))
+    # Default: stop after ONE match (safe smoke test). Pass a number to play
+    # more, or 0 for unlimited:  py chipzen_agent.py 5
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    asyncio.run(run_external_bot(PokerArenaBot, max_matches=(n or None)))
