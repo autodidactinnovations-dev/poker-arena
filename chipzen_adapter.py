@@ -58,6 +58,15 @@ def to_devfun_table(state, game_config, match_id="cz"):
     n = int(game_config.get("num_players") or (len(state.opponent_stacks) + 1))
     sb = int(game_config.get("small_blind") or 0)
     bb = int(game_config.get("big_blind") or 0)
+    # Blinds ESCALATE during a Chipzen match (first match went 50/100 ->
+    # 75/150 -> 150/300). game_config only has the starting level, so read the
+    # real ones from this hand's posts. Using the stale config made the BB look
+    # like a raise, so every hand was played as a "3-bet" spot.
+    for a in state.action_history or []:
+        if a.get("action") == "post_small_blind":
+            sb = int(a.get("amount") or sb)
+        elif a.get("action") == "post_big_blind":
+            bb = int(a.get("amount") or bb)
     me = int(state.your_seat)
 
     # Stacks by seat index.
@@ -208,7 +217,54 @@ def to_chipzen_action(decision, state):
     return Action.fold() if "fold" in valid else Action.call()
 
 
+# --- Heads-up profile ------------------------------------------------------
+# The core was tuned for 6-max. Heads-up, equity vs ONE random hand is high
+# for almost anything, so it raised ~every hand preflop, built pots with junk,
+# then the stack-risk / stalled / aggression brakes folded them away. This
+# filter ONLY runs when there is exactly one opponent and ONLY touches
+# preflop raises. decide_live itself is unchanged, so dev.fun is unaffected.
+HU_PROFILE_ENABLED = True
+HU_OPEN_MIN = 5.0    # Chen score to raise first-in (~top 40%: any pair, A-x good kicker, KTs, QJ...)
+HU_3BET_MIN = 9.0    # Chen score to re-raise a raise (~top 10%: 99+, AQ+, AJs, KQs)
+HU_DEFEND_MIN = 4.0  # Chen score to call a single raise instead of folding
+
+
+def _chen(hole):
+    try:
+        import strategy as S
+        return S._chen_score([S._parse_card(str(c)) for c in hole])
+    except Exception:
+        return 6.0
+
+
+def hu_filter(decision, state, table):
+    """Downgrade weak preflop raises heads-up. Returns (decision, changed_reason)."""
+    if not HU_PROFILE_ENABLED or len(state.opponent_stacks) != 1 or (state.phase or "").lower() != "preflop":
+        return decision, None
+    act = str(decision.get("action", "")).lower()
+    if act not in ("bet", "raise", "all-in", "allin"):
+        return decision, None
+    chen = _chen(state.hole_cards)
+    bb = table.get("bigBlindChips") or 1
+    facing_raise = table.get("currentBet", 0) > bb
+    need = HU_3BET_MIN if facing_raise else HU_OPEN_MIN
+    if chen >= need:
+        return decision, None
+    valid = set(state.valid_actions or [])
+    if "check" in valid:
+        new = "check"
+    elif "call" in valid and (not facing_raise or chen >= HU_DEFEND_MIN) and state.to_call <= 3 * bb:
+        new = "call"
+    else:
+        new = "fold"
+    out = dict(decision, action=new, amount=0)
+    out["_debug"] = dict(decision.get("_debug") or {}, decided_by=f"hu_filter_{new}",
+                         hu_original=(decision.get("_debug") or {}).get("decided_by"), hu_chen=chen)
+    return out, f"chen {chen} < {need}"
+
+
 def decide_chipzen(state, game_config, match_id="cz"):
     table = to_devfun_table(state, game_config, match_id)
     decision = L.decide_live(table)
+    decision, _ = hu_filter(decision, state, table)
     return to_chipzen_action(decision, state), decision

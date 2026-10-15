@@ -97,4 +97,29 @@ for i in range(300):
     if to_call == 0:
         assert act.action != "fold"
 print("4 ok  300 fuzzed states, all legal, never folded a free check")
+
+# 5. Escalated blinds: BB must not look like a raise; junk SB hand must not raise.
+s = gs(hand_number=75, phase="preflop", your_hole_cards=["3h", "Qs"], board=[], pot=450,
+       your_stack=850, opponent_stacks=[9000], your_seat=0, dealer_seat=0, to_call=150,
+       min_raise=600, max_raise=1000, valid=["fold", "call", "raise"],
+       action_history=[
+           {"seat": 0, "action": "post_small_blind", "amount": 150, "phase": "preflop", "is_timeout": False},
+           {"seat": 1, "action": "post_big_blind", "amount": 300, "phase": "preflop", "is_timeout": False}])
+t = A.to_devfun_table(s, HU)
+assert t["bigBlindChips"] == 300 and t["currentBet"] == 300, (t["bigBlindChips"], t["currentBet"])
+act, dec = A.decide_chipzen(s, HU)
+legal(act, s)
+assert act.action != "raise", f"Q3o raised heads-up: {dec}"
+print("5 ok  escalated blinds read from posts; Q3o SB ->", act.to_wire(), dec["_debug"]["decided_by"])
+
+# 6. HU filter keeps premium raises.
+s = gs(hand_number=77, phase="preflop", your_hole_cards=["Ks", "Kd"], board=[], pot=450,
+       your_stack=850, opponent_stacks=[9000], your_seat=0, dealer_seat=0, to_call=150,
+       min_raise=600, max_raise=1000, valid=["fold", "call", "raise"],
+       action_history=[
+           {"seat": 0, "action": "post_small_blind", "amount": 150, "phase": "preflop", "is_timeout": False},
+           {"seat": 1, "action": "post_big_blind", "amount": 300, "phase": "preflop", "is_timeout": False}])
+act, dec = A.decide_chipzen(s, HU)
+assert act.action == "raise", dec
+print("6 ok  KK still raises ->", act.to_wire())
 print("ALL PASS")
