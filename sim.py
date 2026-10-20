@@ -198,7 +198,10 @@ def main():
     ap.add_argument("--opps", default="tag,lag,station,nit,maniac")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--no-hu-filter", action="store_true", help="turn off the Chipzen heads-up preflop filter")
+    ap.add_argument("--no-aggfold", action="store_true", help="switch off live_agent's aggression_fold rule")
     a = ap.parse_args()
+    if a.no_aggfold:
+        A.L.AGGRESSION_FOLD_ENABLED = False
     A.HU_PROFILE_ENABLED = not a.no_hu_filter
     rng = random.Random(a.seed)
     random.seed(a.seed)
@@ -225,7 +228,7 @@ def main():
     print(f"  time: {time.time() - t0:.0f}s  ({len(bb) / max(1e-9, time.time() - t0) * 60:.0f} hands/min)")
     with open("sim_results.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "hands": len(bb), "players": n,
-                            "opps": a.opps, "seed": a.seed, "hu_filter": A.HU_PROFILE_ENABLED,
+                            "opps": a.opps, "seed": a.seed, "hu_filter": A.HU_PROFILE_ENABLED, "aggfold": A.L.AGGRESSION_FOLD_ENABLED,
                             "bb100": round(mean * 100, 2), "ci95": round(1.96 * se, 2)}) + "\n")
 
 
