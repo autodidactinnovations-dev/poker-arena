@@ -35,6 +35,7 @@ import fast_eval
 fast_eval.install()   # identical results, faster equity sims (see test_fast_eval.py)
 
 BB, SB, STACK = 100, 50, 10000
+HERO_HOOK = None   # set by sim_diag.py to inspect each bot decision
 PHASES = ["preflop", "flop", "turn", "river"]
 
 
@@ -133,6 +134,8 @@ def play_hand(n, hero_seat, opps, button, rng, hand_no):
                               "min_raise": min_raise, "max_raise": max_raise, "action_history": list(history)}})
                 act_obj, _dec = A.decide_chipzen(gs, {"small_blind": SB, "big_blind": BB, "num_players": n}, "sim")
                 act, amt = act_obj.action, act_obj.amount
+                if HERO_HOOK:
+                    HERO_HOOK(_dec, act, gs, holes, [s for s in range(n) if s not in folded and s != seat], board_all, board)
             else:
                 act, amt = opps[seat]({"hole": holes[seat], "board": board, "pot": pot, "to_call": to_call,
                                        "current_bet": current, "min_raise": min_raise, "max_raise": max_raise,
