@@ -300,6 +300,22 @@ STACK_RISK_EQUITY_FLOOR = 0.80
 # (observed max 0.40) while river jumps top out around 0.25, so a flat threshold
 # is effectively preflop-only, i.e. backwards. The per-street values below fired
 # on 2 of the same 37 hands, both LOSSES (-83 and -65), and zero winners.
+# §32: equity cushion above raw pot odds before a brake is forbidden to fold.
+# Not zero - the equity estimate carries sampling noise (stdev ~0.010 at 2000
+# trials) and calibration (12) measured it over-confident by 0.181 in the 4-6
+# aggression band. 0.05 keeps the brake's veto on genuinely marginal spots
+# while removing it where equity clearly beats the price.
+S32_PRICE_MARGIN = 0.05
+# A LARGER margin for the aggression_fold arm, sized to a MEASURED bias.
+# calibration (12) found our equity estimate 0.181 OVER-CONFIDENT in the 4-6
+# aggression band - which is exactly the band aggression_fold covers, and the
+# reason §19 was specified to refuse calls that raw pot odds endorse. Using
+# the general 0.05 margin there let a known-inflated equity overrule §19 and
+# broke its primary test case (it called where the spec says fold). 0.20 sits
+# just above the measured bias, so the arm still yields on a price good enough
+# to survive the correction - e.g. two pair at a 4.3% price (equity 0.925 vs
+# 0.043 + 0.20) - while keeping §19 intact on marginal spots.
+S32_AGG_PRICE_MARGIN = 0.20
 STACK_VELOCITY_SHADOW_MODE = False  # ENFORCING (was shadow-only through hand cmtd2ab0)
 STACK_VELOCITY_CAP_BY_STREET = {"Preflop": 0.45, "Flop": 0.35, "Turn": 0.25, "River": 0.20}
 # NO equity override. There was one (0.95), and it is exactly what let hand
@@ -619,6 +635,10 @@ BLUFF_MAX_AGGRESSION = 4.0  # never bluff into a raise war: calibration (12)
                             # measured our equity read at -0.181 over-confident
                             # in the 4-6 aggression band. Bluffing there means
                             # bluffing on a number known to be inflated.
+# §33: 0 = air/no-pair only, i.e. an ACTUAL drawing hand. The arm was
+# admitting made_category <= 1 (one pair), which is the population §26
+# measured losing money. Raising this back to 1 reinstates that leak.
+BLUFF_MAX_MADE_CATEGORY = 0
 BLUFF_MAX_COMMIT = 0.25     # a 40%-committed spot is not a semi-bluff. Excludes
                             # exactly the "escalate then abandon" shape that is
                             # the most expensive pattern in this project's
@@ -649,7 +669,15 @@ SIZING_SCHEME_ENABLED = True    # ON from v46 (2026-09-04 21:05). Enabled after
 # NO MADE-HAND EXEMPTION ON PURPOSE. The bucket's winners are 3 hands at +190.
 # Carving them out would be fitting to noise. If production shows the rule
 # folding too much, add the exemption THEN - with its own bar.
-AGGRESSION_FOLD_ENABLED = True
+# REDESIGN STEP 1 (2026-10-20, Billy's call to switch now, before a shadow
+# period). Postflop facing a bet, decide on RANGE-BASED equity (the S22
+# estimate_equity_ranged that was log-only) instead of random-hand equity
+# minus an aggression discount, and drop aggression_fold. Sim result, ~3-4k
+# hands per field (sim.py, sim_diag.py): TAG -113 -> +42, LAG -235 -> -158,
+# maniac/nit unchanged. NOT yet validated on the live field. Rollback: set
+# this to False (restores the old equity AND aggression_fold exactly).
+REDESIGN_RANGED_ENABLED = True
+AGGRESSION_FOLD_ENABLED = not REDESIGN_RANGED_ENABLED
 # 4.0 -> 3.0 on 2026-10-07. The 4+ band is now EMPTY of pot_odds_call hands
 # (this rule refuses them), and the remaining postflop loss rises monotonically
 # with aggression, measured on chipDelta across S19 runs 126-174:
@@ -883,6 +911,9 @@ _DECIDED_BY = {
     "price is right for this equity": "pot_odds_call",
     "cheap price, defending": "pot_odds_call",
     "price is right, calling": "pot_odds_call",
+    "all-in for less - price is tiny, taking it": "allin_bargain",
+    "price beats the risk cap - calling": "price_over_cap",
+    "their betting says this price is not real - folding": "s22_range_veto",
     "opponent has shown real aggression - not paying this price": "aggression_fold",
     "not enough equity to pay this price": "pot_odds_fold",
     "not worth even the cheap price": "pot_odds_fold",
@@ -1116,6 +1147,17 @@ def decide_live(table):
         if call_chips is None and current_bet is not None:
             call_chips = max(0, int(current_bet) - int(my_bet))
         to_call = call_chips or 0
+        # EFFECTIVE PRICE. A bet larger than our stack cannot cost us more than
+        # the stack: calling all-in for less is always available. Pricing the
+        # FULL bet made every downstream brake read a price we could not be
+        # charged. Observed 2026-10-16, match 3b42d9e8 hand 7: pot 19,924, bet
+        # 7,124, our stack 76 -> the code priced 26% pot odds when the true
+        # price was 0.38%, and aggression_fold folded TRIP FIVES. 44 folds in
+        # 2,190 Chipzen decisions were priced this way, including pocket aces
+        # (velocity_brake, true odds 23%).
+        _stack_num = stack if isinstance(stack, (int, float)) and stack > 0 else None
+        eff_to_call = min(to_call, _stack_num) if _stack_num is not None else to_call
+        allin_for_less = to_call > eff_to_call
         call_amount = call_to_amount if call_to_amount is not None else (current_bet if current_bet is not None else my_bet + to_call)
 
         min_bet_to = allowed.get("minBet")
@@ -1251,6 +1293,21 @@ def decide_live(table):
         except Exception:
             equity = 0.5
 
+        # Redesign step 1 - see REDESIGN_RANGED_ENABLED.
+        redesign_info = None
+        if (REDESIGN_RANGED_ENABLED and street in ("Flop", "Turn", "River")
+                and to_call > 0 and len(hole) == 2):
+            try:
+                _acts = S.opponent_postflop_actions(table, self_seat.get("seatNumber"))
+                _lists = [_acts[s.get("seatNumber")] for s in active_seats if s.get("seatNumber") in _acts]
+                if _lists:
+                    _eq_r, _ = S.estimate_equity_ranged(hole, board, _lists,
+                                                        pending_opponents=len(active_seats) - len(_lists))
+                    redesign_info = {"equity_old": round(equity, 3), "equity_ranged": round(_eq_r, 3)}
+                    equity = _eq_r
+            except Exception:
+                redesign_info = None
+
         chen_norm = min(1.0, S._chen_score(hole) / 20.0) if len(hole) == 2 else 0.5
 
         def has(name):
@@ -1320,7 +1377,44 @@ def decide_live(table):
             except (TypeError, ValueError):
                 return False
 
-        pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.0
+        # Priced off eff_to_call, not to_call - see the note at eff_to_call.
+        pot_odds = eff_to_call / (pot + eff_to_call) if (pot + eff_to_call) > 0 else 0.0
+        # ONE flag, consumed in two places: the bargain branch in the postflop
+        # facing-a-bet arm, AND the stack-risk override further down. The
+        # override is not part of that elif chain - it REWRITES whatever the
+        # chain decided - so exempting only the chain left stack_risk_cap
+        # folding bargains anyway. It was the largest group in the observed
+        # data (14 of 44), so missing it would have fixed the minority case.
+        allin_bargain = allin_for_less and equity >= pot_odds
+        # §32 PRICE IS GOOD. The commitment-fraction brakes (stack_risk_cap,
+        # velocity_brake) ask "is this too much of my stack?" and never consult
+        # the price. In a big pot commitment fraction is high BY CONSTRUCTION,
+        # so they fire hardest exactly where the price is best and folding
+        # costs most. Measured: brake-folds won 67% at showdown in pots
+        # >= 8,000 vs 31% below (§30). Observed folds include top pair at a
+        # 27.3% price (match 39184d52 hand 3, velocity_brake) and 40.3%
+        # equity at an 11.4% price (match c603c5cc hand 97, stack_risk_cap).
+        #
+        # This does NOT disable either brake. They keep their real job -
+        # refusing to over-commit with a WEAK hand - and keep every
+        # raise->call and ->check downgrade. They only lose the ability to
+        # FOLD when our equity already beats the price being asked.
+        # §36 (2026-10-18): the margin SCALES WITH AGGRESSION instead of being
+        # a flat 0.05. Our equity is a Monte Carlo against a near-uniform
+        # opponent range, NOT against their betting range - so it is inflated
+        # exactly when someone is firing at us. calibration (12) measured the
+        # bias at 0.181 in the 4-6 aggression band. I already used 0.20 for the
+        # aggression_fold arm for that reason, then left a flat 0.05 on the
+        # others, which trusted the inflated number in the one situation it is
+        # known to be wrong.
+        # Observed cost: match 7a139bfb hand 15 - 7hQd (Q-high) on 9s Kh Ks,
+        # price 31%, estimator said >=36%, price_over_cap overrode the brake
+        # and we called off 1,078 into a king-paired board. Three streets of
+        # paying with nothing, which is what "it got me to keep throwing in
+        # chips with a bad hand" looks like from the inside.
+        _agg_for_margin = min(1.0, (aggression_score or 0.0) / BLUFF_MAX_AGGRESSION)
+        _price_margin = S32_PRICE_MARGIN + (S32_AGG_PRICE_MARGIN - S32_PRICE_MARGIN) * _agg_for_margin
+        price_is_good = (to_call or 0) > 0 and equity >= pot_odds + _price_margin
         bb_chips = table.get("bigBlindChips")
 
         if street == "Preflop":
@@ -1402,6 +1496,18 @@ def decide_live(table):
                 # enough to call a raise. Checked before the price test on
                 # purpose - the point is that a good price does not rescue an
                 # unopenable hand. BB exempt: see PREFLOP_POLARIZE_ENABLED.
+                # ALL-IN BARGAIN (preflop). Ahead of the polarize rules for the
+                # same reason as postflop: those rules fire BEFORE the price
+                # test on purpose ("a good price does not rescue an unopenable
+                # hand"), which is right at a normal price and wrong when the
+                # bet exceeds our stack and the real price is a few percent of
+                # the pot. 8 of the 44 mispriced folds observed on 2026-10-16
+                # were preflop polarize folds at true odds of 4-28%.
+                # Sits AFTER the raise arms, so a hand worth raising still
+                # raises - this only ever converts a FOLD into a CALL.
+                elif allin_bargain and has("call"):
+                    action, amount, msg = ("call", call_amount,
+                                           "all-in for less - price is tiny, taking it")
                 elif (PREFLOP_POLARIZE_ENABLED and _t is None
                       and _seat_label != "BB" and has("fold")):
                     action, amount, msg = "fold", 0, \
@@ -1456,6 +1562,18 @@ def decide_live(table):
                 # along. This is the branch where 408 of our preflop calls live.
                 # `check` still comes first when it is free - folding a free
                 # option is never right (see test_never_fold_free_check).
+                # ALL-IN BARGAIN (preflop). Ahead of the polarize rules for the
+                # same reason as postflop: those rules fire BEFORE the price
+                # test on purpose ("a good price does not rescue an unopenable
+                # hand"), which is right at a normal price and wrong when the
+                # bet exceeds our stack and the real price is a few percent of
+                # the pot. 8 of the 44 mispriced folds observed on 2026-10-16
+                # were preflop polarize folds at true odds of 4-28%.
+                # Sits AFTER the raise arms, so a hand worth raising still
+                # raises - this only ever converts a FOLD into a CALL.
+                elif allin_bargain and has("call"):
+                    action, amount, msg = ("call", call_amount,
+                                           "all-in for less - price is tiny, taking it")
                 elif (PREFLOP_POLARIZE_ENABLED and to_call > 0
                       and _seat_label != "BB" and has("fold")):
                     action, amount, msg = "fold", 0, \
@@ -1514,7 +1632,24 @@ def decide_live(table):
                 elif (SIZING_SCHEME_ENABLED and has("bet")
                       and street in ("Turn", "River")
                       and made_category is not None
-                      and made_category <= 1
+                      # DRAWS ONLY (changed 2026-10-17, §33). Was
+                      # `made_category <= 1`, which admitted ONE-PAIR hands -
+                      # and v46's own note records what that selected: "Of 36
+                      # selected spots, 30 are one-pair and 6 cat-0", i.e. 83%
+                      # were weak MADE hands, not draws, while the message
+                      # says "semi-bluffing with a draw".
+                      #
+                      # A semi-bluff earns from fold equity PLUS the chance to
+                      # improve. A weak made pair has neither: worse hands
+                      # fold, better hands call, and it does not improve. So
+                      # betting it is neither a bluff nor a value bet.
+                      # Forensics on 13 big-pot showdown losses (Chipzen
+                      # matches a9d9bc49, 28e59232): we held ONE PAIR in 9 of
+                      # them and semi_bluff appears in 9 of them - weak pairs
+                      # raising the turn, called, losing to a better hand.
+                      # Matches §26's chip attribution on dev.fun: turn
+                      # semi_bluff -5.2/hand, river -21.2/hand.
+                      and made_category <= BLUFF_MAX_MADE_CATEGORY
                       and equity >= BLUFF_MIN_EQUITY
                       and (num_opponents or 0) <= BLUFF_MAX_OPPONENTS
                       and (aggression_score or 0.0) < BLUFF_MAX_AGGRESSION
@@ -1537,10 +1672,27 @@ def decide_live(table):
             else:
                 # Clamped at >= 0 AFTER every bump: see _MIN_CALL_MARGIN note below.
                 call_margin = max(0.0, 0.06 - loose_bonus * 0.5 + escalation_bump + opp_bump)
+                # ALL-IN BARGAIN. Sits ahead of EVERY brake on purpose.
+                #
+                # The brakes refuse a call on the theory that paying a big price
+                # into shown aggression is -EV (§18/§19 were specified to refuse
+                # "regardless of pot odds"). That theory assumes the price is
+                # big. When the bet exceeds our stack we are all-in for less,
+                # so the price is capped at the stack and is frequently a few
+                # percent of the pot - at which point refusing is simply
+                # burning a called-for bet. This is NOT a threshold change to
+                # the brakes: outside all-in-for-less, nothing here fires.
+                #
+                # Condition is plain correct-price play on the REAL price:
+                # call when equity beats the effective pot odds.
+                if allin_bargain and has("call"):
+                    action, amount, msg = ("call", call_amount,
+                                           "all-in for less - price is tiny, taking it")
                 # Stalled-hand guard (see stalled_hand_fold above). Checked
                 # before the call branch, but AFTER raising - a hand strong
                 # enough to raise is never "stalled". Never touches check.
-                if has("fold") and stalled_hand_fold(street, made_category, equity, to_call):
+                elif (has("fold") and not price_is_good
+                      and stalled_hand_fold(street, made_category, equity, to_call)):
                     action, amount, msg = "fold", 0, \
                         "hand never developed - not paying another street with nothing"
                 elif equity >= raise_thresh and has("raise"):
@@ -1566,8 +1718,17 @@ def decide_live(table):
                 # It cannot reach the two preflop pot_odds_call sites, where
                 # aggression_score is absent/unreliable, and it cannot fire at
                 # to_call == 0 because this whole block is the to_call > 0 else.
+                # `not price_is_good` added 2026-10-17. §19 was specified to
+                # "refuse the call regardless of pot odds", which is coherent
+                # at a normal price and indefensible at a good one: this arm
+                # folded TWO PAIR at a 4.3% price (match 038fbd1d hand 25,
+                # Kc6s on Qs Ac Kh 3d 6d, 429 to win 9,600) and top pair
+                # kings twice at ~34%. Price-blindness was the whole defect
+                # §32 fixed in stack_risk_cap/velocity_brake; this arm and
+                # stalled_guard had the identical defect and were missed.
                 elif (AGGRESSION_FOLD_ENABLED
                       and (aggression_score or 0.0) >= AGGRESSION_FOLD_THRESHOLD
+                      and not (equity >= pot_odds + S32_AGG_PRICE_MARGIN)
                       and has("fold")):
                     # SHADOW LOG. Observation only - `action` below is
                     # unchanged, the fold still happens. shadow_action is
@@ -1663,7 +1824,12 @@ def decide_live(table):
         # needs a separate, lower whole-hand threshold (see FINDINGS.md).
         my_total_committed = self_seat.get("totalCommittedChips", my_bet) or my_bet
         already_committed_other_streets = max(0, my_total_committed - my_bet)
-        if stack is not None and action in ("call", "bet", "raise", "all-in") and amount:
+        # `not allin_bargain`: the cap asks "is this too much of my stack?",
+        # which is moot when the bet already exceeds the stack - the stack is
+        # the maximum either way, and folding forfeits it for nothing while
+        # the price is a few percent of the pot.
+        if (stack is not None and action in ("call", "bet", "raise", "all-in")
+                and amount and not allin_bargain):
             total_available = my_total_committed + stack
             if total_available > 0:
                 commit_frac = (amount + already_committed_other_streets) / total_available
@@ -1673,8 +1839,13 @@ def decide_live(table):
                         action, amount, msg = "call", call_amount, "capping risk - re-raising here outruns my edge, taking the cheaper line"
                     elif to_call == 0 and has("check"):
                         action, amount, msg = "check", 0, "capping risk - checking instead of over-committing"
-                    elif has("fold"):
+                    elif has("fold") and not price_is_good:
                         action, amount, msg = "fold", 0, "capping risk - not enough edge to justify this much of my stack"
+                    elif price_is_good and has("call"):
+                        # §32: equity beats the price - take it rather than
+                        # forfeit a pot we are favoured in.
+                        action, amount, msg = ("call", call_amount,
+                                               "price beats the risk cap - calling")
 
         # Velocity brake, SHADOW MODE: evaluate and record what it would have
         # done, but never override the live action while
@@ -1692,13 +1863,48 @@ def decide_live(table):
                         pot=pot)
                     shadow["would"] = _verdict
                     shadow["actual"] = action
-                    if _verdict and not STACK_VELOCITY_SHADOW_MODE:
+                    # §38: `amount` is rewritten by the override block below,
+                    # so the proposed bet has to be captured HERE.
+                    _s38_proposed = amount
+                    # Same exemption as the stack-risk cap above: this brake
+                    # is ENFORCING (STACK_VELOCITY_SHADOW_MODE is False), so
+                    # without this it overrides a bargain call into a fold. It
+                    # is what refused pocket aces at a true 23% price in the
+                    # observed data. The shadow record above is still written,
+                    # so the would-be verdict stays visible.
+                    if _verdict and not STACK_VELOCITY_SHADOW_MODE and not allin_bargain:
                         if _verdict == "call":
                             action, amount, msg = "call", call_amount, "capping risk - that moves too much of my stack at once, taking the cheaper line"
                         elif _verdict == "check":
                             action, amount, msg = "check", 0, "capping risk - taking the free card instead of committing this fast"
-                        else:
+                        elif not price_is_good:
                             action, amount, msg = "fold", 0, "capping risk - too much of my stack committed in a single move"
+                        elif has("call"):
+                            action, amount, msg = ("call", call_amount,
+                                                   "price beats the risk cap - calling")
+                    # §38 PHASE 1, SHADOW ONLY. Logs the check-downgrade node
+                    # and the cap-respecting bet that was available instead.
+                    # Scoped to to_call == 0, which is the ONLY node where the
+                    # brake's distrust-the-estimate rationale does not apply.
+                    if (S38_SHADOW_ENABLED and _verdict == "check"
+                            and (to_call or 0) == 0):
+                        _s38_cap = shadow.get("cap")
+                        shadow_record_s38(
+                            table.get("id") or table.get("tableId"), {
+                                "street": street,
+                                "equity": round(equity, 3),
+                                "made_category": made_category,
+                                "pot": pot,
+                                "total_available": _total_avail,
+                                "delta_frac": round(_delta, 3),
+                                "cap": _s38_cap,
+                                "aggression_score": round(aggression_score or 0.0, 2),
+                                "proposed_amount": int(_s38_proposed or 0),
+                                "capped_amount": (int(_s38_cap * _total_avail)
+                                                  if _s38_cap is not None else None),
+                                "enforced": not STACK_VELOCITY_SHADOW_MODE,
+                                "equity_times_pot": round(equity * (pot or 0), 1),
+                            })
         except Exception:
             shadow = {"error": "velocity brake evaluation failed"}
 
@@ -1714,6 +1920,24 @@ def decide_live(table):
             "aggression": round(aggression, 2), "thresholds": thresholds,
             "opp_raises_this_street": opp_raises, "escalation_bump": round(escalation_bump, 2),
             "aggressor_seat": aggressor_seat, "opp_bump": round(opp_bump, 3),
+            # Exposure to the all-in-for-less bug was UNMEASURABLE on dev.fun
+            # because absolute stack was never logged - only stack_commit_frac.
+            "stack": stack, "eff_to_call": eff_to_call, "allin_for_less": allin_for_less,
+            # §34 PHASE 1: stack geometry. All of this was already in `table`
+            # and thrown away. Not consumed by any decision - logged to answer
+            # "how often are we in the zone where the brakes are backwards?"
+            "opp_stacks": [sv.get("stackChips") for sv in seats
+                           if isinstance(sv, dict)
+                           and sv.get("seatNumber") != self_seat.get("seatNumber")],
+            "stack_bb": (round(stack / bb_chips, 1)
+                         if stack is not None and bb_chips else None),
+            "spr": (round(stack / pot, 2) if stack is not None and pot else None),
+            "total_chips": table.get("_participant_total_chips"),
+            "buyin": table.get("_participant_initial_chips"),
+            "below_buyin": (None if table.get("_participant_total_chips") is None
+                            or table.get("_participant_initial_chips") is None
+                            else table["_participant_total_chips"]
+                                 < table["_participant_initial_chips"]),
             "range_strength": round(range_strength, 2),
             "aggression_score": round(aggression_score, 2),
             "made_category": made_category,
@@ -1768,6 +1992,8 @@ def decide_live(table):
             "stack_commit_frac": round((amount + already_committed_other_streets) / (my_total_committed + stack), 3)
                                   if stack and (my_total_committed + stack) > 0 else None,
         }
+        if redesign_info:
+            result["_debug"]["redesign"] = redesign_info
         # §24 shadow: archive-counted ahead-probability vs the last aggressor.
         # LOG ONLY - never read by any decision (DESIGN_BACKLOG §13/§24).
         # Any failure is swallowed. Separate try from §22 below, so either
@@ -1801,6 +2027,69 @@ def decide_live(table):
                     "pot_odds": round(pot_odds, 4), "opp_actions": _lists, "num_pending": num_pending,
                     "hole": hole_raw, "board": board_raw})
                 result["_debug"]["equity_ranged"] = round(_eq_r, 3)
+                # THE VETO. Only ever call -> fold. `equity` says the price is
+                # fine; the action-conditioned estimate says their betting
+                # makes it not fine. Measured: these calls lost 226 chips each
+                # on average over 10 instances.
+                # `opp_bump >= 0`: do NOT veto when we have an OPPONENT-SPECIFIC
+                # read that they bet with air. equity_ranged is a POPULATION
+                # prior (a flop bet is 25% air on average); opp_bump < 0 means
+                # THIS villain is measurably looser than that. When the two
+                # disagree, the specific read wins - overriding it with the
+                # average is exactly backwards, and that is the whole purpose
+                # of opponent_read_bump. Caught by test_call_margin_floor's
+                # control case: equity 0.45 vs pot_odds 0.261 against a bluffy
+                # villain (opp_bump -0.15) was being folded.
+                if (S22_VETO_ENABLED and result.get("action") == "call"
+                        and equity >= pot_odds and _eq_r < pot_odds
+                        and opp_bump >= 0
+                        and has("fold")):
+                    result["action"], result["amount"] = "fold", 0
+                    result["message"] = "their betting says this price is not real - folding"
+                    if allowed.get("reasoningRequired"):
+                        result["reasoning"] = build_reasoning(_eq_r, pot_odds, "fold")
+                    result["_debug"]["decided_by"] = "s22_range_veto"
+                    result["_debug"]["s22_vetoed_from"] = "call"
+        except Exception:
+            pass
+        # §37 PHASE 1 shadow: range-blindness on the BETTING side. LOG ONLY.
+        # Mirrors the §22 block but for to_call == 0 value bets, where
+        # equity_ranged does not otherwise exist. Writes to its OWN file so
+        # §22's "facing a bet" sample stays uncontaminated. Computes the
+        # estimate only on value_bet/value_raise - see the latency note at
+        # S37_SHADOW_ENABLED.
+        try:
+            _db = (result.get("_debug") or {}).get("decided_by")
+            if (S37_SHADOW_ENABLED and street in ("Flop", "Turn", "River")
+                    and to_call == 0 and len(hole) == 2
+                    and _db in ("value_bet", "value_raise")):
+                _a37 = S.opponent_postflop_actions(table, self_seat.get("seatNumber"))
+                _l37 = [_a37.get(sv.get("seatNumber"), []) for sv in certain_seats]
+                _t37 = time.time()
+                _eqr37, _acc37 = S.estimate_equity_ranged(
+                    hole, board, _l37, pending_opponents=num_pending,
+                    pending_weight=pending_weight)
+                shadow_record_s37(table.get("id") or table.get("tableId"), {
+                    "street": street, "equity": round(equity, 4),
+                    "equity_ranged": round(_eqr37, 4),
+                    "accept_rate": round(_acc37, 3) if _acc37 is not None else None,
+                    "secs": round(time.time() - _t37, 2),
+                    "decided_by": _db, "action": result.get("action"),
+                    "amount": result.get("amount"), "pot": pot,
+                    # board_texture is a FUNCTION - logging the object itself
+                    # would make json.dumps raise, the except would swallow it,
+                    # and §37 would silently collect ZERO rows while appearing
+                    # to work. Call it, as the main debug dict does.
+                    "board_texture": (board_texture(board_raw)[0]
+                                      if board_raw else None),
+                    "made_category": made_category,
+                    "opp_actions": _l37, "num_pending": num_pending,
+                    "hole": hole_raw, "board": board_raw})
+                result["_debug"]["equity_ranged_bet"] = round(_eqr37, 3)
+                # NO VETO HERE. §22's bar measured the CALL side only;
+                # vetoing value bets is unmeasured (§37's own bar must clear
+                # first). The §22 veto above cannot reach these rows anyway -
+                # it requires action == "call" and this arm is a bet/raise.
         except Exception:
             pass
         return result
@@ -1968,6 +2257,47 @@ def shadow_record_fold(hand_id, rec):
 # hand_id (chipDelta + all hole cards). Pre-registered bar: DESIGN_BACKLOG §22.
 S22_SHADOW_ENABLED = True
 S22_PATH = "shadow_equity_ranged.jsonl"
+# §22 SHIPPED 2026-10-19, after its PRE-REGISTERED bar cleared on 300 eligible
+# post-fit rows:
+#   Brier equity 0.2244 -> equity_ranged 0.1944  (better calibrated)
+#   calls it would flip to folds: 10, summed chipDelta -2,260 (they lost)
+# Better on EVERY street separately (Flop 0.2150->0.1953, Turn 0.2235->0.1857,
+# River 0.2596->0.2114), which is why river is included despite the FIT still
+# having no river rows - the fallback was tested, not assumed.
+#
+# WIRED AS A ONE-DIRECTIONAL VETO, deliberately. Condition 2 of the bar
+# measured exactly one quantity: calls that `equity` makes and `equity_ranged`
+# prices below pot odds. So that is all this does - it can turn a CALL into a
+# FOLD and nothing else. It never creates a call, never touches a raise, and
+# never feeds a threshold. Per §13 every threshold stays tuned on the old
+# `equity`, so no re-derivation is needed and the change stays attributable.
+S22_VETO_ENABLED = True
+
+# --- §37 PHASE 1: range-blindness on the BETTING side. SHADOW ONLY. ---------
+# §22 proved equity is miscalibrated when we FACE a bet, and its veto fixed
+# the call side. The same blindness applies to our own VALUE BETS: `equity`
+# rates two pair highly in absolute terms and ignores what the opponent
+# CONTINUING implies. Our own fitted table says continuing is strong evidence:
+#     Flop call  n=255  air 0.24  pair 0.65  two_pair+ 0.11
+#     Flop check n=948  air 0.63  pair 0.32  two_pair+ 0.06
+# A caller is 2.6x less likely to hold air than a checker and we weight them
+# the same. Observed cost (Mimaima233, 0-3): big pots lost at showdown with
+# our flush into a better flush, two pair into a flush, trips into a straight
+# - while 91% of our value bets went into connected boards and 25% into
+# 3-flush boards.
+#
+# SEPARATE FILE, deliberately. §22's sample is defined as "postflop decisions
+# FACING a bet". Writing to_call == 0 rows into shadow_equity_ranged.jsonl
+# would corrupt §22's ongoing measurement, whose bar is already cleared and
+# still being tracked.
+#
+# LATENCY: one estimate_equity_ranged call costs p50 160ms / p99 300ms on top
+# of a p50 451ms decision. Fine on the external path (5,000ms) but it pushes
+# the UPLOAD path (500ms, §35) further out of reach. Hence it is computed ONLY
+# on value_bet/value_raise spots, never on every to_call == 0 spot - we check
+# 43% of the time and those need nothing.
+S37_SHADOW_ENABLED = True
+S37_PATH = "shadow_value_bet_ranged.jsonl"
 
 
 def real_hand_id(hand_id):
@@ -2004,6 +2334,50 @@ def shadow_record_s24(hand_id, rec):
         rec = dict(rec, hand_id=hand_id, competition_id=COMPETITION_ID,
                    logged_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
         with open(S24_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+def shadow_record_s37(hand_id, rec):
+    """§37 Phase 1. Same guards as every other shadow logger: opt-in LIVE,
+    arena-shaped hand_id, never raises into the decision path."""
+    try:
+        if not shadow_writes_allowed():
+            return
+        if not real_hand_id(hand_id):
+            return
+        rec = dict(rec, hand_id=hand_id, competition_id=COMPETITION_ID,
+                   logged_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        with open(S37_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
+# --- §38 PHASE 1 (shadow only) --------------------------------------------
+# The velocity brake downgrades a BET to a CHECK at to_call == 0. Its own
+# rationale is to distrust our equity ESTIMATE when commitment spikes - but at
+# to_call == 0 we choose the bet size ourselves, so "commit less" is available
+# and "commit nothing" is a different action that forfeits the hand's value.
+# Phase 1 logs the cap-respecting bet we COULD have made. It changes nothing.
+# See DESIGN_BACKLOG.md §38 for the bar (n >= 60, summed chipDelta below
+# summed equity*pot).
+S38_SHADOW_ENABLED = True
+S38_PATH = "shadow_velocity_check.jsonl"
+
+
+def shadow_record_s38(hand_id, rec):
+    """§38 Phase 1. Same guards as every other shadow logger: opt-in LIVE,
+    arena-shaped hand_id, never raises into the decision path."""
+    try:
+        if not shadow_writes_allowed():
+            return
+        if not real_hand_id(hand_id):
+            return
+        rec = dict(rec, hand_id=hand_id, competition_id=COMPETITION_ID,
+                   logged_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        with open(S38_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
@@ -2538,6 +2912,14 @@ def main():
         if tables:
             tables_sorted = sorted(tables, key=lambda t: t.get("actionDeadlineAt") or float("inf"))
             table = tables_sorted[0]
+            # §34 PHASE 1 (measurement only). decide_live cannot otherwise see
+            # participant-level chips, and the dev.fun rebuy asymmetry turns on
+            # exactly that figure: the rebuy gate is total chips < bigBlind,
+            # and a rebuy restores initialChips (1000). So below 1000 a bust is
+            # a PROFITABLE reset and above it a real loss. Nothing reads this
+            # yet - it is logged so the opportunity can be sized first.
+            table = dict(table, _participant_total_chips=participant.get("totalChips"),
+                         _participant_initial_chips=participant.get("initialChips"))
             decision = decide_live(table)
             debug = decision.pop("_debug", {})
             body = {"tableId": table.get("tableId") or table.get("id"), **decision}
@@ -2649,6 +3031,13 @@ def main():
         tables = resp.get("tables") or []
         if tables:
             table = tables[0]
+            # §34 PHASE 1 at the DRAIN call site too. The main loop's copy was
+            # added first and this twin nearly got missed - the same
+            # one-of-two oversight as the watchdog counter and the four
+            # price-blind brakes. Without it, drain-path decisions would log
+            # below_buyin=None and silently thin the sample.
+            table = dict(table, _participant_total_chips=(resp.get("participant") or {}).get("totalChips"),
+                         _participant_initial_chips=(resp.get("participant") or {}).get("initialChips"))
             decision = decide_live(table)
             debug = decision.pop("_debug", {})
             body = {"tableId": table.get("tableId") or table.get("id"), **decision}
